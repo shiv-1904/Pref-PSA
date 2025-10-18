@@ -1,0 +1,284 @@
+#include <bits/stdc++.h>
+#include "cache.h"
+using namespace std;
+
+/* ======================================================
+   VLDP Prefetcher (L2 Cache version for your repo)
+   ====================================================== */
+
+class ShiftRegister {
+public:
+    ShiftRegister(unsigned size = 4) : size(size), width(64 / size), reg(0) {}
+    void insert(int x) {
+        x &= (1 << width) - 1;
+        reg = (reg << width) | x;
+    }
+    uint64_t get_code(unsigned le, unsigned ri) const {
+        uint64_t mask = (1ull << (width * (ri - le))) - 1ull;
+        return (reg >> (le * width)) & mask;
+    }
+    int get_value(int i) const {
+        int x = get_code(i, i + 1);
+        int d = 32 - width;
+        return (x << d) >> d;
+    }
+private:
+    unsigned size, width;
+    uint64_t reg;
+};
+
+class SaturatingCounter {
+public:
+    SaturatingCounter(int bits = 2) : max((1 << bits) - 1), cnt(0) {}
+    void inc() { if (cnt < max) cnt++; }
+    void dec() { if (cnt > 0) cnt--; }
+    int get_cnt() const { return cnt; }
+private:
+    int max, cnt;
+};
+
+/* ---------- Data Structures ---------- */
+
+struct DeltaHistoryBufferData {
+    uint64_t last_addr;
+    ShiftRegister deltas;
+    int last_predictor;
+    int num_times_used;
+
+    DeltaHistoryBufferData() : last_addr(0), deltas(4), last_predictor(0), num_times_used(0) {}
+    DeltaHistoryBufferData(uint64_t addr, const ShiftRegister &sr, int lp, int used)
+        : last_addr(addr), deltas(sr), last_predictor(lp), num_times_used(used) {}
+};
+
+template <class T>
+class NMRUFullyAssociativeCache {
+public:
+    struct Entry { uint64_t key; bool valid; T data; };
+    NMRUFullyAssociativeCache(int size) : entries(size) {}
+    Entry* find(uint64_t key) {
+        for (size_t i = 0; i < entries.size(); i++)
+            if (entries[i].valid && entries[i].key == key)
+                return &entries[i];
+        return NULL;
+    }
+    Entry* insert(uint64_t key, const T &data) {
+        for (size_t i = 0; i < entries.size(); i++)
+            if (!entries[i].valid) {
+                entries[i] = {key, true, data};
+                return &entries[i];
+            }
+        int victim = rand() % entries.size();
+        entries[victim] = {key, true, data};
+        return &entries[victim];
+    }
+private:
+    vector<Entry> entries;
+};
+
+class DeltaHistoryBuffer : public NMRUFullyAssociativeCache<DeltaHistoryBufferData> {
+public:
+    using Super = NMRUFullyAssociativeCache<DeltaHistoryBufferData>;
+    using Super::Super;
+    int update(uint64_t page, uint64_t offset) {
+        Entry *e = find(page);
+        if (e) {
+            int delta = offset - e->data.last_addr;
+            if (delta == 0) return 0;
+            e->data.deltas.insert(delta);
+            e->data.last_addr = offset;
+            e->data.num_times_used++;
+            return delta;
+        } else {
+            insert(page, DeltaHistoryBufferData(offset, ShiftRegister(4), 0, 1));
+            return -1;
+        }
+    }
+};
+
+struct OffsetPredictionTableData {
+    int pred;
+    bool accuracy;
+};
+
+class OffsetPredictionTable {
+public:
+    struct Entry { uint64_t key; OffsetPredictionTableData data; bool valid; };
+    OffsetPredictionTable(int size) { entries.reserve(size); }
+
+    void update(int first_offset, int delta) {
+        for (size_t i = 0; i < entries.size(); i++)
+            if (entries[i].valid && entries[i].key == (uint64_t)first_offset) {
+                if (entries[i].data.pred == delta)
+                    entries[i].data.accuracy = true;
+                else if (!entries[i].data.accuracy)
+                    entries[i].data.pred = delta;
+                else
+                    entries[i].data.accuracy = false;
+                return;
+            }
+        entries.push_back({(uint64_t)first_offset, {delta, false}, true});
+    }
+
+    Entry* find(uint64_t key) {
+        for (size_t i = 0; i < entries.size(); i++)
+            if (entries[i].valid && entries[i].key == key)
+                return &entries[i];
+        return NULL;
+    }
+
+private:
+    vector<Entry> entries;
+};
+
+struct DeltaPredictionTableData {
+    int pred;
+    SaturatingCounter accuracy;
+};
+
+class DeltaPredictionTable : public NMRUFullyAssociativeCache<DeltaPredictionTableData> {
+public:
+    using NMRUFullyAssociativeCache<DeltaPredictionTableData>::NMRUFullyAssociativeCache;
+};
+
+class DeltaPredictionTables {
+public:
+    DeltaPredictionTables(int size)
+        : tables(3, DeltaPredictionTable(size)) {}
+
+    void update(uint64_t page, const ShiftRegister &deltas, int last_predictor) {
+        uint64_t key = deltas.get_code(1, last_predictor + 2);
+        DeltaPredictionTable::Entry *entry = tables[last_predictor].find(key);
+        if (entry) {
+            int last_delta = deltas.get_value(0);
+            DeltaPredictionTableData &data = entry->data;
+            if (data.pred == last_delta)
+                data.accuracy.inc();
+            else {
+                data.accuracy.dec();
+                if (data.accuracy.get_cnt() == 0)
+                    data.pred = last_delta;
+                if (last_predictor < 2)
+                    tables[last_predictor + 1].insert(
+                        deltas.get_code(1, last_predictor + 3),
+                        (DeltaPredictionTableData){last_delta, SaturatingCounter(2)});
+            }
+        }
+    }
+
+    pair<int, int> get_prediction(const ShiftRegister &deltas) {
+        for (int i = 2; i >= 0; i--) {
+            uint64_t key = deltas.get_code(0, i + 1);
+            DeltaPredictionTable::Entry *entry = tables[i].find(key);
+            if (entry)
+                return make_pair(entry->data.pred, i);
+        }
+        return make_pair(0, 0);
+    }
+
+private:
+    vector<DeltaPredictionTable> tables;
+};
+
+/* ---------- VLDP Prefetcher ---------- */
+
+class VLDP {
+public:
+    VLDP(int page_size, int degree, int dhb_size = 16, int opt_size = 64, int dpt_size = 64)
+        : page_size(page_size), degree(degree),
+          dhb(dhb_size), opt(opt_size), dpt(dpt_size) {}
+
+    vector<uint64_t> access(uint64_t blk) {
+        uint64_t page = blk / page_size;
+        int offset = blk % page_size;
+        int delta = dhb.update(page, offset);
+        if (delta == 0) return vector<uint64_t>();
+
+        DeltaHistoryBuffer::Entry *entry = dhb.find(page);
+        DeltaHistoryBufferData &data = entry->data;
+
+        if (data.num_times_used == 1) {
+            OffsetPredictionTable::Entry *e = opt.find(offset);
+            if (!e || !e->data.accuracy) return vector<uint64_t>();
+            vector<uint64_t> pf; pf.push_back(e->data.pred + page * page_size);
+            return pf;
+        } else if (data.num_times_used == 2) {
+            uint64_t first_offset = offset - delta;
+            opt.update(first_offset, delta);
+        } else {
+            dpt.update(page, data.deltas, data.last_predictor);
+        }
+
+        vector<uint64_t> preds;
+        ShiftRegister deltas = data.deltas;
+        for (int i = 0; i < degree; i++) {
+            pair<int, int> pred = dpt.get_prediction(deltas);
+            int pd = pred.first;
+            int idx = pred.second;
+            if (pd == 0 || (i > 0 && idx == 0)) break;
+            blk += pd;
+            if (blk / page_size == page)
+                preds.push_back(blk);
+            deltas.insert(pd);
+            data.last_predictor = idx;
+        }
+        return preds;
+    }
+
+private:
+    int page_size, degree;
+    DeltaHistoryBuffer dhb;
+    OffsetPredictionTable opt;
+    DeltaPredictionTables dpt;
+};
+
+/* ---------- Globals ---------- */
+
+static vector<VLDP> vldp_prefetchers;
+const int PREFETCH_DEGREE = 4;
+const int DHB_SIZE = 16;
+const int OPT_SIZE = 64;
+const int DPT_SIZE = 64;
+
+/* ---------- Integration with CACHE ---------- */
+
+void CACHE::l2c_prefetcher_initialize() {
+    static bool init = false;
+    if (init) return;
+    init = true;
+    vldp_prefetchers = vector<VLDP>(
+        NUM_CPUS,
+        VLDP(PAGE_SIZE >> LOG2_BLOCK_SIZE, PREFETCH_DEGREE, DHB_SIZE, OPT_SIZE, DPT_SIZE)
+    );
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip,
+                                       uint8_t cache_hit, uint8_t type,
+                                       uint32_t metadata_in, uint8_t critical_ip_flag) {
+    (void)type;
+    (void)critical_ip_flag;
+
+    uint32_t cpu = this->cpu;
+    uint64_t block_number = addr >> LOG2_BLOCK_SIZE;
+
+    // Trigger only on demand misses
+    if (cache_hit)
+        return metadata_in;
+
+    vector<uint64_t> pf_blocks = vldp_prefetchers[cpu].access(block_number);
+    for (size_t i = 0; i < pf_blocks.size(); i++) {
+        uint64_t pf_addr = pf_blocks[i] << LOG2_BLOCK_SIZE;
+        prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+    }
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way,
+                                          uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in) {
+    (void)addr; (void)set; (void)way; (void)prefetch; (void)evicted_addr;
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats() {
+    // Optional: print or log final statistics here
+}
