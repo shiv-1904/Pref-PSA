@@ -1,0 +1,140 @@
+#include "cache.h"
+#include <vector>
+#include <cstdint>
+#include <cassert>
+using namespace std;
+
+/* ==================== Core data structures ==================== */
+
+class RecentRequestsTable {
+  public:
+    struct Entry { uint64_t key; bool valid; };
+    explicit RecentRequestsTable(int size) : size(size), table(size) {}
+    void insert(uint64_t block) {
+        int idx = hash(block);
+        table[idx] = {block, true};
+    }
+    bool contains(uint64_t block) const {
+        int idx = hash(block);
+        return table[idx].valid && table[idx].key == block;
+    }
+  private:
+    int hash(uint64_t addr) const { return (addr ^ (addr >> 8)) & (size - 1); }
+    int size;
+    vector<Entry> table;
+};
+
+class BestOffsetLearning {
+  public:
+    explicit BestOffsetLearning(int blocks_per_page) : n_blocks(blocks_per_page) {
+        for (int i = 1; i < n_blocks; i++) {
+            int n = i;
+            for (int p : {2, 3, 5}) while (n % p == 0) n /= p;
+            if (n == 1) offsets.push_back({i, 0});
+        }
+    }
+    int test(uint64_t block, const RecentRequestsTable& rr) {
+        if (offsets.empty()) return 0;
+        Entry &e = offsets[index];
+        int page_off = block % n_blocks;
+        bool hit = in_page(page_off - e.offset) && rr.contains(block - e.offset);
+        if (hit) {
+            e.score++;
+            if (e.score > best_score) { best_score = e.score; best_off = e.offset; }
+        }
+        index = (index + 1) % offsets.size();
+        if (index == 0) {
+            round++;
+            if (best_score >= SCORE_MAX || round >= ROUND_MAX) {
+                global_best = (best_score <= BAD_SCORE) ? 0 : best_off;
+                for (auto &x : offsets) x.score = 0;
+                best_score = 0; round = 0;
+            }
+        }
+        return global_best;
+    }
+  private:
+    struct Entry { int offset; int score; };
+    bool in_page(int off) const { return off >= 0 && off < n_blocks; }
+    int n_blocks;
+    vector<Entry> offsets;
+    int index = 0;
+    int best_score = 0;
+    int best_off = 0;
+    int global_best = 1;
+    int round = 0;
+    static constexpr int SCORE_MAX = 31;
+    static constexpr int ROUND_MAX = 100;
+    static constexpr int BAD_SCORE = 1;
+};
+
+class BOP {
+  public:
+    BOP(int blocks_per_page, int rr_size, int degree)
+        : n_blocks(blocks_per_page), degree(degree),
+          rr(rr_size), bol(blocks_per_page) {}
+    vector<uint64_t> access(uint64_t block) {
+        vector<uint64_t> preds;
+        int page_off = block % n_blocks;
+        for (int i = 1; i <= degree; ++i) {
+            if (best_off != 0 && in_page(page_off + i * best_off))
+                preds.push_back(block + i * best_off);
+            else
+                break;
+        }
+        best_off = bol.test(block, rr);
+        return preds;
+    }
+    void cache_fill(uint64_t block, bool is_prefetch) {
+        int page_off = block % n_blocks;
+        if ((best_off == 0 && is_prefetch) || (best_off != 0 && !is_prefetch)) return;
+        if (!in_page(page_off - best_off)) return;
+        rr.insert(block - best_off);
+    }
+  private:
+    bool in_page(int off) const { return off >= 0 && off < n_blocks; }
+    int n_blocks;
+    int degree;
+    int best_off = 0;
+    RecentRequestsTable rr;
+    BestOffsetLearning bol;
+};
+
+/* ==================== Global instance ==================== */
+
+static const int RR_TABLE_SIZE = 256;
+static const int DEGREE = 1;
+static BOP bop_prefetcher(PAGE_SIZE / BLOCK_SIZE, RR_TABLE_SIZE, DEGREE);
+
+/* ==================== ChampSim hooks ==================== */
+
+void CACHE::l2c_prefetcher_initialize() {}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit,
+                                       uint8_t type, uint32_t metadata_in, uint8_t critical_ip_flag)
+{
+    // Trigger prefetch on cache miss
+    if (cache_hit)
+        return metadata_in;
+
+    uint64_t block = addr >> LOG2_BLOCK_SIZE;
+    auto to_prefetch = bop_prefetcher.access(block);
+
+    for (auto pf_block : to_prefetch) {
+        uint64_t pf_addr = pf_block << LOG2_BLOCK_SIZE;
+        // Prefetch into L2 cache using your repo’s API
+        prefetch_line(ip, addr, pf_addr, FILL_L2, metadata_in);
+    }
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way,
+                                          uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    uint64_t block = addr >> LOG2_BLOCK_SIZE;
+    bop_prefetcher.cache_fill(block, prefetch);
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats() {}
