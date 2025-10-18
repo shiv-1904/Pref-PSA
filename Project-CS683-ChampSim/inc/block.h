@@ -124,7 +124,11 @@ class PACKET {
     uint64_t full_physical_address;
     bool send_both_tlb; // For STLB (if true, STLB should return translation to both DTLB and ITLB)
     bool send_both_cache;    // For L2C (if true, L2C should return data to both L1D and L1C)
-
+    
+    // === @SHIVAM ===
+    bool page_is_2MB;   // Page-size info: 0 = 4KB, 1 = 2MB
+    // ======================
+    
     //@Vishal: PTW
     uint64_t full_virtual_address;
     uint8_t translation_level,
@@ -213,6 +217,8 @@ class PACKET {
         l1_pq_index = -1;
     	full_physical_address = 0;
 	send_both_tlb = false;
+    
+page_is_2MB = false;   // @Shivam default 4KB page
     };
 };
 
